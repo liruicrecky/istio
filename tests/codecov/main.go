@@ -35,7 +35,7 @@ var (
 
 func parseReportLine(line string) (string, float64, error) {
 	// <option value="file0">istio.io/istio/galley/cmd/shared/shared.go (0.0%)</option>
-	reg := regexp.MustCompile(` *<option value=\"(.*)\">(.*) \((.*)%\)</option>`)
+	reg := regexp.MustCompile(` *<option value="(.*)">(.*) \((.*)%\)</option>`)
 	if m := reg.FindStringSubmatch(line); len(m) != 0 {
 		cov, err := strconv.ParseFloat(m[3], 64)
 		if err != nil {
@@ -60,6 +60,7 @@ func parseReport(filename string) (map[string]float64, error) {
 	}()
 
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096*8), bufio.MaxScanTokenSize*8)
 	for scanner.Scan() {
 		if pkg, cov, err := parseReportLine(scanner.Text()); err == nil {
 			coverage[pkg] = cov

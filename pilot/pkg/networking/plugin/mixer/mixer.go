@@ -35,7 +35,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/plugin"
 	"istio.io/istio/pilot/pkg/networking/util"
-	"istio.io/istio/pkg/log"
+	"istio.io/pkg/log"
 )
 
 type mixerplugin struct{}
@@ -51,20 +51,6 @@ const (
 	// defaultConfig is the default service config (that does not correspond to an actual service)
 	defaultConfig = "default"
 
-	// workload-bound annotations for controlling mixerfilter
-	policyCheckAnnotation = "policy.istio.io/check"
-
-	// workload-bound annotation for max number of retries on transport error
-	policyCheckRetriesAnnotation = "policy.istio.io/checkRetries"
-
-	// workload-bound annotation for base time to wait between retries, will be adjusted by backoff and jitter.
-	// In duration format. Example: 80ms.
-	policyCheckBaseRetryWaitTimeAnnotation = "policy.istio.io/checkBaseRetryWaitTime"
-
-	// workload-bound annotation for max time to wait between retries
-	// In duration format. Example: 1000ms.
-	policyCheckMaxRetryWaitTimeAnnotation = "policy.istio.io/checkMaxRetryWaitTime"
-
 	// force enable policy checks for both inbound and outbound calls
 	policyCheckEnable = "enable"
 
@@ -73,6 +59,17 @@ const (
 
 	// force enable policy checks for both inbound and outbound calls, but fail open on errors
 	policyCheckEnableAllow = "allow-on-error"
+
+	// default number of retries for policy checks
+	defaultRetries = 0
+)
+
+var (
+	// default base retry wait time for policy checks
+	defaultBaseRetryWaitTime = types.DurationProto(80 * time.Millisecond)
+
+	// default maximum wait time for policy checks
+	defaultMaxRetryWaitTime = types.DurationProto(1000 * time.Millisecond)
 )
 
 type direction int
@@ -102,15 +99,29 @@ func (mixerplugin) OnOutboundListener(in *plugin.InputParams, mutable *plugin.Mu
 
 	switch in.ListenerProtocol {
 	case plugin.ListenerProtocolHTTP:
-		filter := buildOutboundHTTPFilter(in.Env.Mesh, attrs, in.Node)
+		httpFilter := buildOutboundHTTPFilter(in.Env.Mesh, attrs, in.Node)
 		for cnum := range mutable.FilterChains {
-			mutable.FilterChains[cnum].HTTP = append(mutable.FilterChains[cnum].HTTP, filter)
+			mutable.FilterChains[cnum].HTTP = append(mutable.FilterChains[cnum].HTTP, httpFilter)
 		}
 		return nil
 	case plugin.ListenerProtocolTCP:
-		filter := buildOutboundTCPFilter(in.Env.Mesh, attrs, in.Node, in.Service, in.Push)
-		for cnum := range mutable.FilterChains {
-			mutable.FilterChains[cnum].TCP = append(mutable.FilterChains[cnum].TCP, filter)
+		tcpFilter := buildOutboundTCPFilter(in.Env.Mesh, attrs, in.Node, in.Service, in.Push)
+		if in.Node.Type == model.Router {
+			// For gateways, due to TLS termination, a listener marked as TCP could very well
+			// be using a HTTP connection manager. So check the filterChain.listenerProtocol
+			// to decide the type of filter to attach
+			httpFilter := buildOutboundHTTPFilter(in.Env.Mesh, attrs, in.Node)
+			for cnum := range mutable.FilterChains {
+				if mutable.FilterChains[cnum].ListenerProtocol == plugin.ListenerProtocolHTTP {
+					mutable.FilterChains[cnum].HTTP = append(mutable.FilterChains[cnum].HTTP, httpFilter)
+				} else {
+					mutable.FilterChains[cnum].TCP = append(mutable.FilterChains[cnum].TCP, tcpFilter)
+				}
+			}
+		} else {
+			for cnum := range mutable.FilterChains {
+				mutable.FilterChains[cnum].TCP = append(mutable.FilterChains[cnum].TCP, tcpFilter)
+			}
 		}
 		return nil
 	}
@@ -173,7 +184,7 @@ func (mixerplugin) OnOutboundCluster(in *plugin.InputParams, cluster *xdsapi.Clu
 		// config telemetry service discovery to be strict_dns for session affinity.
 		// To enable session affinity, DNS needs to provide only one and the same telemetry instance IP
 		// (e.g. in k8s, telemetry service spec needs to have SessionAffinity: ClientIP)
-		cluster.Type = xdsapi.Cluster_STRICT_DNS
+		cluster.ClusterDiscoveryType = &xdsapi.Cluster_Type{Type: xdsapi.Cluster_STRICT_DNS}
 		addr := util.BuildAddress(in.Service.Address, uint32(in.Port.Port))
 		cluster.LoadAssignment = &xdsapi.ClusterLoadAssignment{
 			ClusterName: cluster.Name,
@@ -217,7 +228,7 @@ func (mixerplugin) OnInboundRouteConfiguration(in *plugin.InputParams, routeConf
 	if in.Env.Mesh.MixerCheckServer == "" && in.Env.Mesh.MixerReportServer == "" {
 		return
 	}
-	is11 := util.IsProxyVersionGE11(in.Node)
+	isXDSMarshalingToAnyEnabled := util.IsXDSMarshalingToAnyEnabled(in.Node)
 	switch in.ListenerProtocol {
 	case plugin.ListenerProtocolHTTP:
 		// copy structs in place
@@ -225,7 +236,7 @@ func (mixerplugin) OnInboundRouteConfiguration(in *plugin.InputParams, routeConf
 			host := routeConfiguration.VirtualHosts[i]
 			for j := 0; j < len(host.Routes); j++ {
 				route := host.Routes[j]
-				if is11 {
+				if isXDSMarshalingToAnyEnabled {
 					route.TypedPerFilterConfig = addTypedServiceConfig(route.TypedPerFilterConfig, buildInboundRouteConfig(in.Push, in, in.ServiceInstance))
 				} else {
 					route.PerFilterConfig = addServiceConfig(route.PerFilterConfig, buildInboundRouteConfig(in.Push, in, in.ServiceInstance))
@@ -265,7 +276,7 @@ func buildTransport(mesh *meshconfig.MeshConfig, node *model.Proxy) *mccpb.Trans
 	}
 
 	// apply proxy-level overrides
-	if annotation, ok := node.Metadata[policyCheckAnnotation]; ok {
+	if annotation, ok := node.Metadata[model.NodeMetadataPolicyCheck]; ok {
 		switch annotation {
 		case policyCheckEnable:
 			policy = mccpb.FAIL_CLOSE
@@ -276,7 +287,8 @@ func buildTransport(mesh *meshconfig.MeshConfig, node *model.Proxy) *mccpb.Trans
 
 	networkFailPolicy := &mccpb.NetworkFailPolicy{Policy: policy}
 
-	if annotation, ok := node.Metadata[policyCheckRetriesAnnotation]; ok {
+	networkFailPolicy.MaxRetry = defaultRetries
+	if annotation, ok := node.Metadata[model.NodeMetadataPolicyCheckRetries]; ok {
 		retries, err := strconv.Atoi(annotation)
 		if err != nil {
 			log.Warnf("unable to parse retry limit %q.", annotation)
@@ -285,7 +297,8 @@ func buildTransport(mesh *meshconfig.MeshConfig, node *model.Proxy) *mccpb.Trans
 		}
 	}
 
-	if annotation, ok := node.Metadata[policyCheckBaseRetryWaitTimeAnnotation]; ok {
+	networkFailPolicy.BaseRetryWait = defaultBaseRetryWaitTime
+	if annotation, ok := node.Metadata[model.NodeMetadataPolicyCheckBaseRetryWaitTime]; ok {
 		dur, err := time.ParseDuration(annotation)
 		if err != nil {
 			log.Warnf("unable to parse base retry wait time %q.", annotation)
@@ -294,7 +307,8 @@ func buildTransport(mesh *meshconfig.MeshConfig, node *model.Proxy) *mccpb.Trans
 		}
 	}
 
-	if annotation, ok := node.Metadata[policyCheckMaxRetryWaitTimeAnnotation]; ok {
+	networkFailPolicy.MaxRetryWait = defaultMaxRetryWaitTime
+	if annotation, ok := node.Metadata[model.NodeMetadataPolicyCheckMaxRetryWaitTime]; ok {
 		dur, err := time.ParseDuration(annotation)
 		if err != nil {
 			log.Warnf("unable to parse max retry wait time %q.", annotation)
@@ -304,9 +318,11 @@ func buildTransport(mesh *meshconfig.MeshConfig, node *model.Proxy) *mccpb.Trans
 	}
 
 	res := &mccpb.TransportConfig{
-		CheckCluster:      buildUpstreamName(mesh.MixerCheckServer),
-		ReportCluster:     buildUpstreamName(mesh.MixerReportServer),
-		NetworkFailPolicy: networkFailPolicy,
+		CheckCluster:          buildUpstreamName(mesh.MixerCheckServer),
+		ReportCluster:         buildUpstreamName(mesh.MixerReportServer),
+		NetworkFailPolicy:     networkFailPolicy,
+		ReportBatchMaxEntries: mesh.ReportBatchMaxEntries,
+		ReportBatchMaxTime:    mesh.ReportBatchMaxTime,
 	}
 
 	return res
@@ -331,7 +347,7 @@ func buildOutboundHTTPFilter(mesh *meshconfig.MeshConfig, attrs attributes, node
 		Name: mixer,
 	}
 
-	if util.IsProxyVersionGE11(node) {
+	if util.IsXDSMarshalingToAnyEnabled(node) {
 		out.ConfigType = &http_conn.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(config)}
 	} else {
 		out.ConfigType = &http_conn.HttpFilter_Config{Config: util.MessageToStruct(config)}
@@ -355,7 +371,7 @@ func buildInboundHTTPFilter(mesh *meshconfig.MeshConfig, attrs attributes, node 
 		Name: mixer,
 	}
 
-	if util.IsProxyVersionGE11(node) {
+	if util.IsXDSMarshalingToAnyEnabled(node) {
 		out.ConfigType = &http_conn.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(config)}
 	} else {
 		out.ConfigType = &http_conn.HttpFilter_Config{Config: util.MessageToStruct(config)}
@@ -365,10 +381,10 @@ func buildInboundHTTPFilter(mesh *meshconfig.MeshConfig, attrs attributes, node 
 }
 
 func modifyOutboundRouteConfig(push *model.PushContext, in *plugin.InputParams, httpRoute route.Route) route.Route {
-	is11 := util.IsProxyVersionGE11(in.Node)
+	isXDSMarshalingToAnyEnabled := util.IsXDSMarshalingToAnyEnabled(in.Node)
 
 	// default config, to be overridden by per-weighted cluster
-	if is11 {
+	if isXDSMarshalingToAnyEnabled {
 		httpRoute.TypedPerFilterConfig = addTypedServiceConfig(httpRoute.TypedPerFilterConfig, &mccpb.ServiceConfig{
 			DisableCheckCalls: disablePolicyChecks(outbound, in.Env.Mesh, in.Node),
 		})
@@ -383,7 +399,7 @@ func modifyOutboundRouteConfig(push *model.PushContext, in *plugin.InputParams, 
 		case *route.RouteAction_Cluster:
 			_, _, hostname, _ := model.ParseSubsetKey(upstreams.Cluster)
 			attrs := addDestinationServiceAttributes(make(attributes), push, hostname)
-			if is11 {
+			if isXDSMarshalingToAnyEnabled {
 				httpRoute.TypedPerFilterConfig = addTypedServiceConfig(httpRoute.TypedPerFilterConfig, &mccpb.ServiceConfig{
 					DisableCheckCalls: disablePolicyChecks(outbound, in.Env.Mesh, in.Node),
 					MixerAttributes:   &mpb.Attributes{Attributes: attrs},
@@ -401,7 +417,7 @@ func modifyOutboundRouteConfig(push *model.PushContext, in *plugin.InputParams, 
 			for _, weighted := range upstreams.WeightedClusters.Clusters {
 				_, _, hostname, _ := model.ParseSubsetKey(weighted.Name)
 				attrs := addDestinationServiceAttributes(make(attributes), push, hostname)
-				if is11 {
+				if isXDSMarshalingToAnyEnabled {
 					weighted.TypedPerFilterConfig = addTypedServiceConfig(weighted.TypedPerFilterConfig, &mccpb.ServiceConfig{
 						DisableCheckCalls: disablePolicyChecks(outbound, in.Env.Mesh, in.Node),
 						MixerAttributes:   &mpb.Attributes{Attributes: attrs},
@@ -468,7 +484,7 @@ func buildOutboundTCPFilter(mesh *meshconfig.MeshConfig, attrsIn attributes, nod
 		Name: mixer,
 	}
 
-	if util.IsProxyVersionGE11(node) {
+	if util.IsXDSMarshalingToAnyEnabled(node) {
 		out.ConfigType = &listener.Filter_TypedConfig{TypedConfig: util.MessageToAny(config)}
 	} else {
 		out.ConfigType = &listener.Filter_Config{Config: util.MessageToStruct(config)}
@@ -479,7 +495,7 @@ func buildOutboundTCPFilter(mesh *meshconfig.MeshConfig, attrsIn attributes, nod
 
 func buildInboundTCPFilter(mesh *meshconfig.MeshConfig, attrs attributes, node *model.Proxy) listener.Filter {
 	config := &mccpb.TcpClientConfig{
-		DisableCheckCalls: disablePolicyChecks(outbound, mesh, node),
+		DisableCheckCalls: disablePolicyChecks(inbound, mesh, node),
 		MixerAttributes:   &mpb.Attributes{Attributes: attrs},
 		Transport:         buildTransport(mesh, node),
 	}
@@ -487,7 +503,7 @@ func buildInboundTCPFilter(mesh *meshconfig.MeshConfig, attrs attributes, node *
 		Name: mixer,
 	}
 
-	if util.IsProxyVersionGE11(node) {
+	if util.IsXDSMarshalingToAnyEnabled(node) {
 		out.ConfigType = &listener.Filter_TypedConfig{TypedConfig: util.MessageToAny(config)}
 	} else {
 		out.ConfigType = &listener.Filter_Config{Config: util.MessageToStruct(config)}
@@ -559,7 +575,7 @@ func disablePolicyChecks(dir direction, mesh *meshconfig.MeshConfig, node *model
 	}
 
 	// override with proxy settings
-	if policy, ok := node.Metadata[policyCheckAnnotation]; ok {
+	if policy, ok := node.Metadata[model.NodeMetadataPolicyCheck]; ok {
 		switch policy {
 		case policyCheckDisable:
 			disable = true

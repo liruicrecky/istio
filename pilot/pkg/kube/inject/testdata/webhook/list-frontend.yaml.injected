@@ -1,10 +1,15 @@
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   creationTimestamp: null
   name: frontend
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: hello
+      tier: frontend
+      track: stable
   strategy: {}
   template:
     metadata:
@@ -39,13 +44,15 @@ spec:
         - --serviceCluster
         - hello.$(POD_NAMESPACE)
         - --drainDuration
-        - 2s
+        - 45s
         - --parentShutdownDuration
-        - 3s
+        - 1m0s
         - --discoveryAddress
-        - istio-pilot:15007
+        - istio-pilot:15010
         - --zipkinAddress
         - ""
+        - --dnsRefreshRate
+        - 300s
         - --connectTimeout
         - 1s
         - --proxyAdminPort
@@ -81,6 +88,7 @@ spec:
               fieldPath: metadata.namespace
         - name: ISTIO_META_INTERCEPTION_MODE
           value: REDIRECT
+        - name: ISTIO_META_INCLUDE_INBOUND_PORTS
         image: gcr.io/istio-release/proxyv2:master-latest-daily
         imagePullPolicy: IfNotPresent
         name: istio-proxy
@@ -98,7 +106,7 @@ spec:
         resources:
           limits:
             cpu: "2"
-            memory: 128Mi
+            memory: 1Gi
           requests:
             cpu: 100m
             memory: 128Mi
@@ -141,6 +149,8 @@ spec:
           capabilities:
             add:
             - NET_ADMIN
+          runAsNonRoot: false
+          runAsUser: 0
       volumes:
       - emptyDir:
           medium: Memory

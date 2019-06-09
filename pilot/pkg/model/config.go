@@ -200,6 +200,10 @@ type ProtoSchema struct {
 	// ClusterScoped is true for resource in cluster-level.
 	ClusterScoped bool
 
+	// Name of the (go) object define the schema. Leave blank to infer from the 'Type' below.
+	// This field is used to generate Kube CRD types map (pilot/pkg/config/kube/crd/types.go).
+	SchemaObjectName string
+
 	// Type is the config proto type.
 	Type string
 
@@ -279,6 +283,9 @@ type IstioConfigStore interface {
 
 	// ServiceRoleBindings selects ServiceRoleBindings in the specified namespace.
 	ServiceRoleBindings(namespace string) []Config
+
+	// AuthorizationPolicies selects AuthorizationPolicies in the specified namespace.
+	AuthorizationPolicies(namespace string) []Config
 
 	// RbacConfig selects the RbacConfig of name DefaultRbacConfigName.
 	RbacConfig() *Config
@@ -445,25 +452,27 @@ var (
 
 	// AuthenticationPolicy describes an authentication policy.
 	AuthenticationPolicy = ProtoSchema{
-		Type:        "policy",
-		Plural:      "policies",
-		Group:       "authentication",
-		Version:     "v1alpha1",
-		MessageName: "istio.authentication.v1alpha1.Policy",
-		Validate:    ValidateAuthenticationPolicy,
-		Collection:  metadata.IstioAuthenticationV1alpha1Policies.Collection.String(),
+		SchemaObjectName: "AuthenticationPolicy",
+		Type:             "policy",
+		Plural:           "policies",
+		Group:            "authentication",
+		Version:          "v1alpha1",
+		MessageName:      "istio.authentication.v1alpha1.Policy",
+		Validate:         ValidateAuthenticationPolicy,
+		Collection:       metadata.IstioAuthenticationV1alpha1Policies.Collection.String(),
 	}
 
 	// AuthenticationMeshPolicy describes an authentication policy at mesh level.
 	AuthenticationMeshPolicy = ProtoSchema{
-		ClusterScoped: true,
-		Type:          "mesh-policy",
-		Plural:        "mesh-policies",
-		Group:         "authentication",
-		Version:       "v1alpha1",
-		MessageName:   "istio.authentication.v1alpha1.Policy",
-		Validate:      ValidateAuthenticationPolicy,
-		Collection:    metadata.IstioAuthenticationV1alpha1Meshpolicies.Collection.String(),
+		ClusterScoped:    true,
+		SchemaObjectName: "AuthenticationMeshPolicy",
+		Type:             "mesh-policy",
+		Plural:           "mesh-policies",
+		Group:            "authentication",
+		Version:          "v1alpha1",
+		MessageName:      "istio.authentication.v1alpha1.Policy",
+		Validate:         ValidateAuthenticationPolicy,
+		Collection:       metadata.IstioAuthenticationV1alpha1Meshpolicies.Collection.String(),
 	}
 
 	// ServiceRole describes an RBAC service role.
@@ -489,8 +498,20 @@ var (
 		Collection:    metadata.IstioRbacV1alpha1Servicerolebindings.Collection.String(),
 	}
 
+	// AuthorizationPolicy describes an authorization policy.
+	AuthorizationPolicy = ProtoSchema{
+		ClusterScoped: false,
+		Type:          "authorization-policy",
+		Plural:        "authorization-policies",
+		Group:         "rbac",
+		Version:       "v1alpha1",
+		MessageName:   "istio.rbac.v1alpha1.AuthorizationPolicy",
+		Validate:      ValidateAuthorizationPolicy,
+		Collection:    metadata.IstioRbacV1alpha1Authorizationpolicies.Collection.String(),
+	}
+
 	// RbacConfig describes the mesh level RBAC config.
-	// Deprecated, use ClusterRbacConfig instead.
+	// Deprecated: use ClusterRbacConfig instead.
 	// See https://github.com/istio/istio/issues/8825 for more details.
 	RbacConfig = ProtoSchema{
 		Type:        "rbac-config",
@@ -530,6 +551,7 @@ var (
 		AuthenticationMeshPolicy,
 		ServiceRole,
 		ServiceRoleBinding,
+		AuthorizationPolicy,
 		RbacConfig,
 		ClusterRbacConfig,
 	}
@@ -648,6 +670,14 @@ func (store *istioConfigStore) ServiceEntries() []Config {
 // sortConfigByCreationTime sorts the list of config objects in ascending order by their creation time (if available).
 func sortConfigByCreationTime(configs []Config) []Config {
 	sort.SliceStable(configs, func(i, j int) bool {
+		// If creation time is the same, then behavior is nondeterministic. In this case, we can
+		// pick an arbitrary but consistent ordering based on name and namespace, which is unique.
+		// CreationTimestamp is stored in seconds, so this is not uncommon.
+		if configs[i].CreationTimestamp == configs[j].CreationTimestamp {
+			in := configs[i].Name + "." + configs[i].Namespace
+			jn := configs[j].Name + "." + configs[j].Namespace
+			return in < jn
+		}
 		return configs[i].CreationTimestamp.Before(configs[j].CreationTimestamp)
 	})
 	return configs
@@ -897,10 +927,8 @@ func (store *istioConfigStore) AuthenticationPolicyForWorkload(service *Service,
 						continue
 					}
 					log.Debugf("matched auth policy (%s/%s) with workload: %s", spec.Namespace, spec.Name, labels)
-				} else {
-					if service.Hostname != ResolveShortnameToFQDN(dest.Name, spec.ConfigMeta) {
-						continue
-					}
+				} else if service.Hostname != ResolveShortnameToFQDN(dest.Name, spec.ConfigMeta) {
+					continue
 				}
 				// If destination port is defined, it must match.
 				if len(dest.Ports) > 0 {
@@ -968,6 +996,16 @@ func (store *istioConfigStore) ServiceRoleBindings(namespace string) []Config {
 	}
 
 	return bindings
+}
+
+func (store *istioConfigStore) AuthorizationPolicies(namespace string) []Config {
+	authorizationPolicies, err := store.List(AuthorizationPolicy.Type, namespace)
+	if err != nil {
+		log.Errorf("failed to get AuthorizationPolicy in namespace %s: %v", namespace, err)
+		return nil
+	}
+
+	return authorizationPolicies
 }
 
 func (store *istioConfigStore) ClusterRbacConfig() *Config {

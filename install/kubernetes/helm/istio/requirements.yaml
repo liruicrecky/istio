@@ -5,9 +5,6 @@ dependencies:
   - name: security
     version: 1.1.0
     condition: security.enabled
-  - name: ingress
-    version: 1.1.0
-    condition: ingress.enabled
   - name: gateways
     version: 1.1.0
     condition: gateways.enabled
@@ -26,9 +23,6 @@ dependencies:
   - name: prometheus
     version: 1.1.0
     condition: prometheus.enabled
-  - name: servicegraph
-    version: 1.1.0
-    condition: servicegraph.enabled
   - name: tracing
     version: 1.1.0
     condition: tracing.enabled

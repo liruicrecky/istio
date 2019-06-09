@@ -1,5 +1,5 @@
 # istio CA watching all namespaces
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: istio-citadel
@@ -11,7 +11,10 @@ metadata:
     release: {{ .Release.Name }}
     istio: citadel
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: 1
+  selector:
+    matchLabels:
+      istio: citadel
   strategy:
     rollingUpdate:
       maxSurge: 1
@@ -26,7 +29,6 @@ spec:
         istio: citadel
       annotations:
         sidecar.istio.io/inject: "false"
-        scheduler.alpha.kubernetes.io/critical-pod: ""
     spec:
       serviceAccountName: istio-citadel-service-account
 {{- if .Values.global.priorityClassName }}
@@ -58,6 +60,12 @@ spec:
           {{- if .Values.global.trustDomain }}
             - --trust-domain={{ .Values.global.trustDomain }}
           {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /version
+              port: {{ .Values.global.monitoringPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
           resources:
 {{- if .Values.resources }}
 {{ toYaml .Values.resources | indent 12 }}
@@ -77,3 +85,11 @@ spec:
 {{- end }}
       affinity:
       {{- include "nodeaffinity" . | indent 6 }}
+      {{- include "podAntiAffinity" . | indent 6 }}
+      {{- if .Values.tolerations }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 6 }}
+      {{- else if .Values.global.defaultTolerations }}
+      tolerations:
+{{ toYaml .Values.global.defaultTolerations | indent 6 }}
+      {{- end }}

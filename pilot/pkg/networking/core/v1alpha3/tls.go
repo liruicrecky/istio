@@ -15,11 +15,14 @@
 package v1alpha3
 
 import (
+	"reflect"
+	"sort"
 	"strings"
 
 	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/pkg/log"
 )
 
 // Match by source labels, the listener port where traffic comes in, the gateway on which the rule is being
@@ -82,14 +85,14 @@ func hashRuntimeTLSMatchPredicates(match *v1alpha3.TLSMatchAttributes) string {
 	return strings.Join(match.SniHosts, ",") + "|" + strings.Join(match.DestinationSubnets, ",")
 }
 
-func buildSidecarOutboundTLSFilterChainOpts(env *model.Environment, node *model.Proxy, push *model.PushContext, destinationIPAddress string,
+func buildSidecarOutboundTLSFilterChainOpts(env *model.Environment, node *model.Proxy, push *model.PushContext, destinationCIDR string,
 	service *model.Service, listenPort *model.Port, proxyLabels model.LabelsCollection,
 	gateways map[string]bool, configs []model.Config) []*filterChainOpts {
 
 	if !listenPort.Protocol.IsTLS() {
 		return nil
 	}
-
+	actualWildcard, _ := getActualWildcardAndLocalHost(node)
 	// TLS matches are composed of runtime and static predicates.
 	// Static predicates can be evaluated during the generation of the config. Examples: gateway, source labels, etc.
 	// Runtime predicates cannot be evaluated during config generation. Instead the proxy must be configured to
@@ -120,11 +123,11 @@ func buildSidecarOutboundTLSFilterChainOpts(env *model.Environment, node *model.
 		for _, tls := range virtualService.Tls {
 			for _, match := range tls.Match {
 				if matchTLS(match, proxyLabels, gateways, listenPort.Port) {
-					// Use the service's virtual address first.
+					// Use the service's CIDRs.
 					// But if a virtual service overrides it with its own destination subnet match
 					// give preference to the user provided one
-					// destinationIPAddress will be empty for unix domain sockets
-					destinationCIDRs := []string{destinationIPAddress}
+					// destinationCIDR will be empty for services with VIPs
+					destinationCIDRs := []string{destinationCIDR}
 					// Only set CIDR match if the listener is bound to an IP.
 					// If its bound to a unix domain socket, then ignore the CIDR matches
 					// Unix domain socket bound ports have Port value set to 0
@@ -149,23 +152,37 @@ func buildSidecarOutboundTLSFilterChainOpts(env *model.Environment, node *model.
 
 	// HTTPS or TLS ports without associated virtual service
 	if !hasTLSMatch {
-		var clusterName string
 		var sniHosts []string
-		// The service could be nil if we are being called in the context of a sidecar config with
-		// user specified port in the egress listener. Since we dont know the destination service
-		// and this piece of code is establishing the final fallback path, we set the
-		// tcp proxy cluster to a blackhole cluster
-		if service != nil {
-			clusterName = model.BuildSubsetKey(model.TrafficDirectionOutbound, "", service.Hostname, listenPort.Port)
-			// Use the hostname as the SNI value
+
+		// In case of a sidecar config with user defined port, if the user specified port is not the same as the
+		// service's port, then pick the service port if and only if the service has only one port. If service
+		// has multiple ports, then route to a cluster with the listener port (i.e. sidecar defined port) - the
+		// traffic will most likely blackhole.
+		port := listenPort.Port
+		if len(service.Ports) == 1 {
+			port = service.Ports[0].Port
+		}
+
+		clusterName := model.BuildSubsetKey(model.TrafficDirectionOutbound, "", service.Hostname, port)
+		// Use the hostname as the SNI value if and only if we dont have a destination VIP or if the destination is a CIDR.
+		// In both cases, the listener will be bound to 0.0.0.0. So SNI match is the only way to distinguish different
+		// target services. If we have a VIP, then we know the destination. There is no need to do a SNI match. It saves us from
+		// having to generate expensive permutations of the host name just like RDS does..
+		// NOTE that we cannot have two services with the same VIP as our listener build logic will treat it as a collision and
+		// ignore one of the services.
+		svcListenAddress := service.GetServiceAddressForProxy(node)
+		if strings.Contains(svcListenAddress, "/") {
+			// Address is a CIDR, already captured by destinationCIDR parameter.
+			svcListenAddress = ""
+		}
+
+		if len(destinationCIDR) > 0 || len(svcListenAddress) == 0 || svcListenAddress == actualWildcard {
 			sniHosts = []string{string(service.Hostname)}
-		} else {
-			clusterName = util.BlackHoleCluster
 		}
 
 		out = append(out, &filterChainOpts{
 			sniHosts:         sniHosts,
-			destinationCIDRs: []string{destinationIPAddress},
+			destinationCIDRs: []string{destinationCIDR},
 			networkFilters:   buildOutboundNetworkFiltersWithSingleDestination(env, node, clusterName, listenPort),
 		})
 	}
@@ -173,7 +190,7 @@ func buildSidecarOutboundTLSFilterChainOpts(env *model.Environment, node *model.
 	return out
 }
 
-func buildSidecarOutboundTCPFilterChainOpts(env *model.Environment, node *model.Proxy, push *model.PushContext, destinationIPAddress string,
+func buildSidecarOutboundTCPFilterChainOpts(env *model.Environment, node *model.Proxy, push *model.PushContext, destinationCIDR string,
 	service *model.Service, listenPort *model.Port, proxyLabels model.LabelsCollection,
 	gateways map[string]bool, configs []model.Config) []*filterChainOpts {
 
@@ -191,7 +208,7 @@ TcpLoop:
 	for _, config := range configs {
 		virtualService := config.Spec.(*v1alpha3.VirtualService)
 		for _, tcp := range virtualService.Tcp {
-			destinationCIDRs := []string{destinationIPAddress}
+			destinationCIDRs := []string{destinationCIDR}
 			if len(tcp.Match) == 0 {
 				// implicit match
 				out = append(out, &filterChainOpts{
@@ -236,25 +253,34 @@ TcpLoop:
 					destinationCIDRs: virtualServiceDestinationSubnets,
 					networkFilters:   buildOutboundNetworkFilters(env, node, tcp.Route, push, listenPort, config.ConfigMeta),
 				})
+
+				// If at this point there is a filter chain generated with the same CIDR match as the
+				// one that may be generated for the service as the default route, do not generate it.
+				// Otherwise, Envoy will complain about having filter chains with identical matches
+				// and will reject the config.
+				sort.Strings(virtualServiceDestinationSubnets)
+				sort.Strings(destinationCIDRs)
+				if reflect.DeepEqual(virtualServiceDestinationSubnets, destinationCIDRs) {
+					log.Warnf("Existing filter chain with same matching CIDR: %v.", destinationCIDRs)
+					defaultRouteAdded = true
+				}
 			}
 		}
 	}
 
 	if !defaultRouteAdded {
-
-		var clusterName string
-		// The service could be nil if we are being called in the context of a sidecar config with
-		// user specified port in the egress listener. Since we dont know the destination service
-		// and this piece of code is establishing the final fallback path, we set the
-		// tcp proxy cluster to a blackhole cluster
-		if service != nil {
-			clusterName = model.BuildSubsetKey(model.TrafficDirectionOutbound, "", service.Hostname, listenPort.Port)
-		} else {
-			clusterName = util.BlackHoleCluster
+		// In case of a sidecar config with user defined port, if the user specified port is not the same as the
+		// service's port, then pick the service port if and only if the service has only one port. If service
+		// has multiple ports, then route to a cluster with the listener port (i.e. sidecar defined port) - the
+		// traffic will most likely blackhole.
+		port := listenPort.Port
+		if len(service.Ports) == 1 {
+			port = service.Ports[0].Port
 		}
 
+		clusterName := model.BuildSubsetKey(model.TrafficDirectionOutbound, "", service.Hostname, port)
 		out = append(out, &filterChainOpts{
-			destinationCIDRs: []string{destinationIPAddress},
+			destinationCIDRs: []string{destinationCIDR},
 			networkFilters:   buildOutboundNetworkFiltersWithSingleDestination(env, node, clusterName, listenPort),
 		})
 	}
@@ -267,7 +293,7 @@ TcpLoop:
 // In the latter case, there is no service associated with this listen port. So we have to account for this
 // missing service throughout this file
 func buildSidecarOutboundTCPTLSFilterChainOpts(env *model.Environment, node *model.Proxy, push *model.PushContext,
-	configs []model.Config, destinationIPAddress string, service *model.Service, listenPort *model.Port,
+	configs []model.Config, destinationCIDR string, service *model.Service, listenPort *model.Port,
 	proxyLabels model.LabelsCollection, gateways map[string]bool) []*filterChainOpts {
 
 	out := make([]*filterChainOpts, 0)
@@ -278,9 +304,9 @@ func buildSidecarOutboundTCPTLSFilterChainOpts(env *model.Environment, node *mod
 		svcConfigs = configs
 	}
 
-	out = append(out, buildSidecarOutboundTLSFilterChainOpts(env, node, push, destinationIPAddress, service, listenPort,
+	out = append(out, buildSidecarOutboundTLSFilterChainOpts(env, node, push, destinationCIDR, service, listenPort,
 		proxyLabels, gateways, svcConfigs)...)
-	out = append(out, buildSidecarOutboundTCPFilterChainOpts(env, node, push, destinationIPAddress, service, listenPort,
+	out = append(out, buildSidecarOutboundTCPFilterChainOpts(env, node, push, destinationCIDR, service, listenPort,
 		proxyLabels, gateways, svcConfigs)...)
 	return out
 }

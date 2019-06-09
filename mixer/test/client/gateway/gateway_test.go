@@ -206,7 +206,7 @@ func TestGateway(t *testing.T) {
 	// Issues a GET echo request with 0 size body, forward some random source.uid
 	attrs := mixerpb.Attributes{
 		Attributes: map[string]*mixerpb.Attributes_AttributeValue{
-			"source.uid": &mixerpb.Attributes_AttributeValue{Value: &mixerpb.Attributes_AttributeValue_StringValue{
+			"source.uid": {Value: &mixerpb.Attributes_AttributeValue_StringValue{
 				StringValue: "in-mesh-app",
 			}},
 		},
@@ -229,6 +229,9 @@ func (mock) ID(*core.Node) string {
 	return id
 }
 func (mock) GetProxyServiceInstances(_ *model.Proxy) ([]*model.ServiceInstance, error) {
+	return nil, nil
+}
+func (mock) GetProxyWorkloadLabels(proxy *model.Proxy) (model.LabelsCollection, error) {
 	return nil, nil
 }
 func (mock) GetService(_ model.Hostname) (*model.Service, error) { return nil, nil }

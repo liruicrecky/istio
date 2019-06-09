@@ -26,7 +26,6 @@ import (
 	"os"
 	"path"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +34,7 @@ import (
 	"github.com/gogo/protobuf/types"
 	middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-multierror"
 	prom "github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -44,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 
 	mcpapi "istio.io/api/mcp/v1alpha1"
 	meshconfig "istio.io/api/mesh/v1alpha1"
@@ -68,18 +68,18 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/external"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube"
 	srmemory "istio.io/istio/pilot/pkg/serviceregistry/memory"
-	"istio.io/istio/pkg/ctrlz"
 	"istio.io/istio/pkg/features/pilot"
-	"istio.io/istio/pkg/filewatcher"
 	istiokeepalive "istio.io/istio/pkg/keepalive"
 	kubelib "istio.io/istio/pkg/kube"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/mcp/client"
-	"istio.io/istio/pkg/mcp/configz"
+	configz "istio.io/istio/pkg/mcp/configz/client"
 	"istio.io/istio/pkg/mcp/creds"
 	"istio.io/istio/pkg/mcp/monitoring"
 	"istio.io/istio/pkg/mcp/sink"
-	"istio.io/istio/pkg/version"
+	"istio.io/pkg/ctrlz"
+	"istio.io/pkg/env"
+	"istio.io/pkg/filewatcher"
+	"istio.io/pkg/log"
+	"istio.io/pkg/version"
 )
 
 const (
@@ -90,6 +90,12 @@ const (
 
 	// DefaultMCPMaxMsgSize is the default maximum message size
 	DefaultMCPMaxMsgSize = 1024 * 1024 * 4
+
+	// DefaultMCPInitialWindowSize is the default InitialWindowSize value for the gRPC connection.
+	DefaultMCPInitialWindowSize = 1024 * 1024
+
+	// DefaultMCPInitialConnWindowSize is the default Initial ConnWindowSize value for the gRPC connection.
+	DefaultMCPInitialConnWindowSize = 1024 * 1024
 
 	// URL types supported by the config store
 	// example fs:///tmp/configroot
@@ -165,19 +171,19 @@ type ServiceArgs struct {
 
 // PilotArgs provides all of the configuration parameters for the Pilot discovery service.
 type PilotArgs struct {
-	DiscoveryOptions     envoy.DiscoveryServiceOptions
-	Namespace            string
-	Mesh                 MeshArgs
-	Config               ConfigArgs
-	Service              ServiceArgs
-	MeshConfig           *meshconfig.MeshConfig
-	NetworksConfigFile   string
-	CtrlZOptions         *ctrlz.Options
-	Plugins              []string
-	MCPServerAddrs       []string
-	MCPCredentialOptions *creds.Options
-	MCPMaxMessageSize    int
-	KeepaliveOptions     *istiokeepalive.Options
+	DiscoveryOptions         envoy.DiscoveryServiceOptions
+	Namespace                string
+	Mesh                     MeshArgs
+	Config                   ConfigArgs
+	Service                  ServiceArgs
+	MeshConfig               *meshconfig.MeshConfig
+	NetworksConfigFile       string
+	CtrlZOptions             *ctrlz.Options
+	Plugins                  []string
+	MCPMaxMessageSize        int
+	MCPInitialWindowSize     int
+	MCPInitialConnWindowSize int
+	KeepaliveOptions         *istiokeepalive.Options
 	// ForceStop is set as true when used for testing to make the server stop quickly
 	ForceStop bool
 }
@@ -210,11 +216,13 @@ type Server struct {
 	fileWatcher      filewatcher.FileWatcher
 }
 
+var podNamespaceVar = env.RegisterStringVar("POD_NAMESPACE", "", "")
+
 // NewServer creates a new Server instance based on the provided arguments.
 func NewServer(args PilotArgs) (*Server, error) {
 	// If the namespace isn't set, try looking it up from the environment.
 	if args.Namespace == "" {
-		args.Namespace = os.Getenv("POD_NAMESPACE")
+		args.Namespace = podNamespaceVar.Get()
 	}
 	if args.KeepaliveOptions == nil {
 		args.KeepaliveOptions = istiokeepalive.DefaultOption()
@@ -382,7 +390,7 @@ func (s *Server) initMesh(args *PilotArgs) error {
 				return
 			}
 			if !reflect.DeepEqual(mesh, s.mesh) {
-				log.Infof("mesh configurtion file updated to: %s", spew.Sdump(mesh))
+				log.Infof("mesh configuration updated to: %s", spew.Sdump(mesh))
 				if !reflect.DeepEqual(mesh.ConfigSources, s.mesh.ConfigSources) {
 					log.Infof("mesh configuration sources have changed")
 					//TODO Need to re-create or reload initConfigController()
@@ -399,7 +407,7 @@ func (s *Server) initMesh(args *PilotArgs) error {
 	if mesh == nil {
 		// Config file either wasn't specified or failed to load - use a default mesh.
 		if _, mesh, err = GetMeshConfig(s.kubeClient, kube.IstioNamespace, kube.IstioConfigMap); err != nil {
-			log.Warnf("failed to read mesh configuration: %v", err)
+			log.Warnf("failed to read the default mesh configuration: %v, from the %s config map in the %s namespace", err, kube.IstioConfigMap, kube.IstioNamespace)
 			return err
 		}
 
@@ -435,7 +443,8 @@ func (s *Server) initMeshNetworks(args *PilotArgs) error { //nolint: unparam
 		return nil
 	}
 	log.Infof("mesh networks configuration %s", spew.Sdump(meshNetworks))
-	util.ResolveHostsInNetworksConfig(s.meshNetworks)
+	util.ResolveHostsInNetworksConfig(meshNetworks)
+	log.Infof("mesh networks configuration post-resolution %s", spew.Sdump(meshNetworks))
 	s.meshNetworks = meshNetworks
 
 	// Watch the networks config file for changes and reload if it got modified
@@ -448,7 +457,8 @@ func (s *Server) initMeshNetworks(args *PilotArgs) error { //nolint: unparam
 		}
 		if !reflect.DeepEqual(meshNetworks, s.meshNetworks) {
 			log.Infof("mesh networks configuration file updated to: %s", spew.Sdump(meshNetworks))
-			util.ResolveHostsInNetworksConfig(s.meshNetworks)
+			util.ResolveHostsInNetworksConfig(meshNetworks)
+			log.Infof("mesh networks configuration post-resolution %s", spew.Sdump(meshNetworks))
 			s.meshNetworks = meshNetworks
 			if s.kubeRegistry != nil {
 				s.kubeRegistry.InitNetworkLookup(meshNetworks)
@@ -510,43 +520,35 @@ func (s *Server) initMCPConfigController(args *PilotArgs) error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	var clients []*client.Client
-	var clients2 []*sink.Client
+	var clients []*sink.Client
 	var conns []*grpc.ClientConn
 	var configStores []model.ConfigStoreCache
-
-	// TODO - temporarily support both the new and old stack during transition
-	var useLegacyMCPStack bool
-	if os.Getenv("USE_MCP_LEGACY") == "1" {
-		useLegacyMCPStack = true
-		log.Infof("USE_MCP_LEGACY=1 - using legacy MCP client stack")
-	} else {
-		log.Infof("Using new MCP client sink stack")
-	}
 
 	reporter := monitoring.NewStatsContext("pilot/mcp/sink")
 
 	for _, configSource := range s.mesh.ConfigSources {
-		url, err := url.Parse(configSource.Address)
-		if err != nil {
-			cancel()
-			return fmt.Errorf("invalid config URL %s %v", configSource.Address, err)
-		}
-		if url.Scheme == fsScheme {
-			if url.Path == "" {
-				cancel()
-				return fmt.Errorf("invalid fs config URL %s, contains no file path", configSource.Address)
-			}
-			store := memory.Make(model.IstioConfigTypes)
-			configController := memory.NewController(store)
-
-			err := s.makeFileMonitor(url.Path, configController)
+		if strings.Contains(configSource.Address, fsScheme+"://") {
+			url, err := url.Parse(configSource.Address)
 			if err != nil {
 				cancel()
-				return err
+				return fmt.Errorf("invalid config URL %s %v", configSource.Address, err)
 			}
-			configStores = append(configStores, configController)
-			continue
+			if url.Scheme == fsScheme {
+				if url.Path == "" {
+					cancel()
+					return fmt.Errorf("invalid fs config URL %s, contains no file path", configSource.Address)
+				}
+				store := memory.Make(model.IstioConfigTypes)
+				configController := memory.NewController(store)
+
+				err := s.makeFileMonitor(url.Path, configController)
+				if err != nil {
+					cancel()
+					return err
+				}
+				configStores = append(configStores, configController)
+				continue
+			}
 		}
 
 		securityOption := grpc.WithInsecure()
@@ -609,8 +611,14 @@ func (s *Server) initMCPConfigController(args *PilotArgs) error {
 			Time:    args.KeepaliveOptions.Time,
 			Timeout: args.KeepaliveOptions.Timeout,
 		})
+
+		initialWindowSizeOption := grpc.WithInitialWindowSize(int32(args.MCPInitialWindowSize))
+		initialConnWindowSizeOption := grpc.WithInitialConnWindowSize(int32(args.MCPInitialConnWindowSize))
 		msgSizeOption := grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(args.MCPMaxMessageSize))
-		conn, err := grpc.DialContext(ctx, configSource.Address, securityOption, msgSizeOption, keepaliveOption)
+
+		conn, err := grpc.DialContext(
+			ctx, configSource.Address,
+			securityOption, msgSizeOption, keepaliveOption, initialWindowSizeOption, initialConnWindowSizeOption)
 		if err != nil {
 			log.Errorf("Unable to dial MCP Server %q: %v", configSource.Address, err)
 			cancel()
@@ -625,118 +633,25 @@ func (s *Server) initMCPConfigController(args *PilotArgs) error {
 			Reporter:          reporter,
 		}
 
-		if useLegacyMCPStack {
-			cl := mcpapi.NewAggregatedMeshConfigServiceClient(conn)
-			mcpClient := client.New(cl, sinkOptions)
-			configz.Register(mcpClient)
-			clients = append(clients, mcpClient)
-		} else {
-			cl2 := mcpapi.NewResourceSourceClient(conn)
-			mcpClient2 := sink.NewClient(cl2, sinkOptions)
-			configz.Register(mcpClient2)
-			clients2 = append(clients2, mcpClient2)
-		}
+		cl := mcpapi.NewResourceSourceClient(conn)
+		mcpClient := sink.NewClient(cl, sinkOptions)
+		configz.Register(mcpClient)
+		clients = append(clients, mcpClient)
 
 		conns = append(conns, conn)
 		configStores = append(configStores, mcpController)
 	}
 
-	// TODO: remove the below branch when `--mcpServerAddrs` removed
-	if len(configStores) == 0 {
-		for _, addr := range args.MCPServerAddrs {
-			u, err := url.Parse(addr)
-			if err != nil {
-				cancel()
-				return err
-			}
-
-			securityOption := grpc.WithInsecure()
-			if u.Scheme == "mcps" {
-				requiredFiles := []string{
-					args.MCPCredentialOptions.CertificateFile,
-					args.MCPCredentialOptions.KeyFile,
-					args.MCPCredentialOptions.CACertificateFile,
-				}
-				log.Infof("Secure MCP configured. Waiting for required certificate files to become available: %v",
-					requiredFiles)
-				for len(requiredFiles) > 0 {
-					if _, err := os.Stat(requiredFiles[0]); os.IsNotExist(err) {
-						log.Infof("%v not found. Checking again in %v", requiredFiles[0], requiredMCPCertCheckFreq)
-						select {
-						case <-ctx.Done():
-							cancel()
-							return ctx.Err()
-						case <-time.After(requiredMCPCertCheckFreq):
-							// retry
-						}
-						continue
-					}
-					log.Infof("%v found", requiredFiles[0])
-					requiredFiles = requiredFiles[1:]
-				}
-
-				watcher, err := creds.WatchFiles(ctx.Done(), args.MCPCredentialOptions)
-				if err != nil {
-					cancel()
-					return err
-				}
-				credentials := creds.CreateForClient(u.Hostname(), watcher)
-				securityOption = grpc.WithTransportCredentials(credentials)
-			}
-			msgSizeOption := grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(args.MCPMaxMessageSize))
-			conn, err := grpc.DialContext(ctx, u.Host, securityOption, msgSizeOption)
-			if err != nil {
-				log.Errorf("Unable to dial MCP Server %q: %v", u.Host, err)
-				cancel()
-				return err
-			}
-
-			mcpController := coredatamodel.NewController(options)
-			sinkOptions := &sink.Options{
-				CollectionOptions: collections,
-				Updater:           mcpController,
-				ID:                clientNodeID,
-				Reporter:          reporter,
-			}
-
-			if useLegacyMCPStack {
-				cl := mcpapi.NewAggregatedMeshConfigServiceClient(conn)
-				mcpClient := client.New(cl, sinkOptions)
-				configz.Register(mcpClient)
-				clients = append(clients, mcpClient)
-			} else {
-				cl2 := mcpapi.NewResourceSourceClient(conn)
-				mcpClient2 := sink.NewClient(cl2, sinkOptions)
-				configz.Register(mcpClient2)
-				clients2 = append(clients2, mcpClient2)
-			}
-
-			conns = append(conns, conn)
-			configStores = append(configStores, mcpController)
-		}
-	}
-
 	s.addStartFunc(func(stop <-chan struct{}) error {
 		var wg sync.WaitGroup
 
-		if useLegacyMCPStack {
-			for i := range clients {
-				client := clients[i]
-				wg.Add(1)
-				go func() {
-					client.Run(ctx)
-					wg.Done()
-				}()
-			}
-		} else {
-			for i := range clients2 {
-				client := clients2[i]
-				wg.Add(1)
-				go func() {
-					client.Run(ctx)
-					wg.Done()
-				}()
-			}
+		for i := range clients {
+			client := clients[i]
+			wg.Add(1)
+			go func() {
+				client.Run(ctx)
+				wg.Done()
+			}()
 		}
 
 		go func() {
@@ -769,7 +684,7 @@ func (s *Server) initMCPConfigController(args *PilotArgs) error {
 
 // initConfigController creates the config controller in the pilotConfig.
 func (s *Server) initConfigController(args *PilotArgs) error {
-	if len(args.MCPServerAddrs) > 0 || len(s.mesh.ConfigSources) > 0 {
+	if len(s.mesh.ConfigSources) > 0 {
 		if err := s.initMCPConfigController(args); err != nil {
 			return err
 		}
@@ -971,6 +886,7 @@ func (s *Server) initDiscoveryService(args *PilotArgs) error {
 		MeshNetworks:     s.meshNetworks,
 		IstioConfigStore: s.istioConfigStore,
 		ServiceDiscovery: s.ServiceController,
+		PushContext:      model.NewPushContext(),
 	}
 
 	// Set up discovery service
@@ -985,9 +901,8 @@ func (s *Server) initDiscoveryService(args *PilotArgs) error {
 
 	s.EnvoyXdsServer = envoyv2.NewDiscoveryServer(environment,
 		istio_networking.NewConfigGenerator(args.Plugins),
-		s.ServiceController, s.configController)
+		s.ServiceController, s.kubeRegistry, s.configController)
 	s.EnvoyXdsServer.InitDebug(s.mux, s.ServiceController)
-
 	if s.kubeRegistry != nil {
 		// kubeRegistry may use the environment for push status reporting.
 		// TODO: maybe all registries should have this as an optional field ?
@@ -995,6 +910,12 @@ func (s *Server) initDiscoveryService(args *PilotArgs) error {
 		s.kubeRegistry.InitNetworkLookup(s.meshNetworks)
 		s.kubeRegistry.XDSUpdater = s.EnvoyXdsServer
 	}
+
+	// Implement EnvoyXdsServer grace shutdown
+	s.addStartFunc(func(stop <-chan struct{}) error {
+		s.EnvoyXdsServer.Start(stop)
+		return nil
+	})
 
 	// create grpc/http server
 	s.initGrpcServer(args.KeepaliveOptions)
@@ -1018,33 +939,39 @@ func (s *Server) initDiscoveryService(args *PilotArgs) error {
 	s.GRPCListeningAddr = grpcListener.Addr()
 
 	s.addStartFunc(func(stop <-chan struct{}) error {
-		log.Infof("starting discovery service at http=%s grpc=%s", listener.Addr(), grpcListener.Addr())
 		go func() {
-			if err := s.httpServer.Serve(listener); err != nil {
-				log.Warna(err)
+			if pilot.EnableWaitCacheSync && !s.waitForCacheSync(stop) {
+				return
 			}
-		}()
-		go func() {
-			if err := s.grpcServer.Serve(grpcListener); err != nil {
-				log.Warna(err)
-			}
-		}()
 
-		go func() {
-			<-stop
-			model.JwtKeyResolver.Close()
+			log.Infof("starting discovery service at http=%s grpc=%s", listener.Addr(), grpcListener.Addr())
+			go func() {
+				if err := s.httpServer.Serve(listener); err != nil {
+					log.Warna(err)
+				}
+			}()
+			go func() {
+				if err := s.grpcServer.Serve(grpcListener); err != nil {
+					log.Warna(err)
+				}
+			}()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			err := s.httpServer.Shutdown(ctx)
-			if err != nil {
-				log.Warna(err)
-			}
-			if args.ForceStop {
-				s.grpcServer.Stop()
-			} else {
-				s.grpcServer.GracefulStop()
-			}
+			go func() {
+				<-stop
+				model.JwtKeyResolver.Close()
+
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				err := s.httpServer.Shutdown(ctx)
+				if err != nil {
+					log.Warna(err)
+				}
+				if args.ForceStop {
+					s.grpcServer.Stop()
+				} else {
+					s.grpcServer.GracefulStop()
+				}
+			}()
 		}()
 
 		return nil
@@ -1064,30 +991,36 @@ func (s *Server) initDiscoveryService(args *PilotArgs) error {
 		s.SecureGRPCListeningAddr = secureGrpcListener.Addr()
 
 		s.addStartFunc(func(stop <-chan struct{}) error {
-			log.Infof("starting discovery service at secure grpc=%s", secureGrpcListener.Addr())
 			go func() {
-				// This seems the only way to call setupHTTP2 - it may also be possible to set NextProto
-				// on a listener
-				err := s.secureHTTPServer.ServeTLS(secureGrpcListener, "", "")
-				msg := fmt.Sprintf("Stoppped listening on %s", secureGrpcListener.Addr().String())
-				select {
-				case <-stop:
-					log.Info(msg)
-				default:
-					panic(fmt.Sprintf("%s due to error: %v", msg, err))
+				if pilot.EnableWaitCacheSync && !s.waitForCacheSync(stop) {
+					return
 				}
-			}()
-			go func() {
-				<-stop
-				if args.ForceStop {
-					s.grpcServer.Stop()
-				} else {
-					s.grpcServer.GracefulStop()
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				s.secureHTTPServer.Shutdown(ctx)
-				s.secureGRPCServer.Stop()
+
+				log.Infof("starting discovery service at secure grpc=%s", secureGrpcListener.Addr())
+				go func() {
+					// This seems the only way to call setupHTTP2 - it may also be possible to set NextProto
+					// on a listener
+					err := s.secureHTTPServer.ServeTLS(secureGrpcListener, "", "")
+					msg := fmt.Sprintf("Stoppped listening on %s", secureGrpcListener.Addr().String())
+					select {
+					case <-stop:
+						log.Info(msg)
+					default:
+						panic(fmt.Sprintf("%s due to error: %v", msg, err))
+					}
+				}()
+				go func() {
+					<-stop
+					if args.ForceStop {
+						s.grpcServer.Stop()
+					} else {
+						s.grpcServer.GracefulStop()
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					_ = s.secureHTTPServer.Shutdown(ctx)
+					s.secureGRPCServer.Stop()
+				}()
 			}()
 			return nil
 		})
@@ -1186,14 +1119,7 @@ func (s *Server) grpcServerOptions(options *istiokeepalive.Options) []grpc.Serve
 
 	// Temp setting, default should be enough for most supported environments. Can be used for testing
 	// envoy with lower values.
-	var maxStreams int
-	maxStreamsEnv := pilot.MaxConcurrentStreams
-	if len(maxStreamsEnv) > 0 {
-		maxStreams, _ = strconv.Atoi(maxStreamsEnv)
-	}
-	if maxStreams == 0 {
-		maxStreams = 100000
-	}
+	maxStreams := pilot.MaxConcurrentStreams
 
 	grpcOptions := []grpc.ServerOption{
 		grpc.UnaryInterceptor(middleware.ChainUnaryServer(interceptors...)),
@@ -1218,7 +1144,7 @@ func (s *Server) addStartFunc(fn startFunc) {
 // Using a debouncing mechanism to avoid calling the callback multiple times
 // per event.
 func (s *Server) addFileWatcher(file string, callback func()) {
-	s.fileWatcher.Add(file)
+	_ = s.fileWatcher.Add(file)
 	go func() {
 		var timerC <-chan time.Time
 		for {
@@ -1234,4 +1160,24 @@ func (s *Server) addFileWatcher(file string, callback func()) {
 			}
 		}
 	}()
+}
+
+func (s *Server) waitForCacheSync(stop <-chan struct{}) bool {
+	// TODO: remove dependency on k8s lib
+	if !cache.WaitForCacheSync(stop, func() bool {
+		if s.kubeRegistry != nil {
+			if !s.kubeRegistry.HasSynced() {
+				return false
+			}
+		}
+		if !s.configController.HasSynced() {
+			return false
+		}
+		return true
+	}) {
+		log.Errorf("Failed waiting for cache sync")
+		return false
+	}
+
+	return true
 }
